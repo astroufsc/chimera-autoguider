@@ -11,6 +11,8 @@ from chimera.core.event import event
 from chimera.core.exceptions import ChimeraException, ClassLoaderException
 from chimera.core.constants import SYSTEM_CONFIG_DIRECTORY
 
+from chimera.controllers.scheduler.status import SchedulerStatus
+
 from chimera.interfaces.autoguider import Autoguider as IAutoguider
 from chimera.interfaces.autoguider import GuiderStatus
 from chimera.interfaces.autoguider import StarNotFoundException
@@ -67,6 +69,18 @@ class AutoGuider(ChimeraObject,IAutoguider):
 
     """
 
+    __config__ = {"auto_adjust"     : None,     # Auto adjust exposure time in case of saturated sources
+                                                # or faint objects? (use with caution!)
+                  "min_exp_mod"     : 0.5  ,    # If auto_adjust = True, how much can the exposure time decrease
+                                                # to avoid saturation (in %)?
+                  "max_exp_mod"     : 0.5  ,    # If auto_adjust = True, how much can the exposure time increase
+                                                # to improve source counts (in %)?
+                  "min_threshold"   : 0.5  ,    # After a guiding sequence starts the flux of the source may change
+                                                # due to sky transparency issues or else. What is the minimum value
+                                                # (in % of flux @ start) that should still be used for guiding?
+                  "scheduler"       : None ,
+                  }
+
     def __init__(self):
         ChimeraObject.__init__(self)
 
@@ -85,6 +99,18 @@ class AutoGuider(ChimeraObject,IAutoguider):
 
         self.abort = threading.Event()
         self.abort.clear()
+
+    def __start__(self):
+
+        tel = self.getTel()
+        if tel is not None:
+            self._connectTelEvents()
+        else:
+            self.log.warning("Couldn't find telescope. Won't be able to guide without a telescope.")
+
+        self._connectSchedEvents()
+
+        return True
 
     def getTel(self):
         return self.getManager().getProxy(self["telescope"])
@@ -106,6 +132,12 @@ class AutoGuider(ChimeraObject,IAutoguider):
 
     def getSite(self):
         return self.getManager().getProxy(self["site"])
+
+    def getScheduler(self):
+        if self["scheduler"] is not None:
+            return self.getManager().getProxy(self["scheduler"])
+        else:
+            return None
 
     def _getID(self):
         return "autoguider-%s" % time.strftime("%Y%m%d-%H%M%S")
@@ -142,6 +174,11 @@ class AutoGuider(ChimeraObject,IAutoguider):
         :param debug: Run in debug mode?
         :return:
         """
+
+        # Check if telescope is tracking and quits otherwise
+        tel = self.getTel()
+        if not tel.isTracking():
+            raise ChimeraException("Telescope not tracking. Cannot start autoguider if telescope is in stand mode.")
 
         self._debugging = debug
 
@@ -276,8 +313,20 @@ class AutoGuider(ChimeraObject,IAutoguider):
 
     def _takeImageAndResolveStars(self):
 
+        # Todo: If there are saturated sources, try to modify exposure time so that star is suitable for guiding
+        # Todo: If guide star is bellow a certain threshold increase the exposure time
+
         frame = self._takeImage()
         stars = self._findStars(frame)
+
+        if (self["auto_adjust"] is not None) and (self["auto_adjust"].upper() != "FALSE"):
+            self.log.debug("Running in auto-adjust mode...")
+            # check if there is any saturated source that could use some exposure time undersize
+            saturated_stars = [star for star in stars if star["FLAGS"] == 4]
+            if len(saturated_stars) > 0:
+                # Found saturated stars try taking a new image with the minimum exposure time allowed
+                self.imageRequest["exptime"] *= float(self["min_exp_mod"])
+
 
         return stars
 
@@ -391,6 +440,9 @@ class AutoGuider(ChimeraObject,IAutoguider):
                'ReferencePos':Position.fromRaDec("00:00:00","00:00:00")}
 
         try:
+            # Todo: Check that the star is actually there
+            # Todo: Avoid offsets when star is bellow a certain flux threshold
+
             # frame = self._takeImage()
             fname = '/tmp/autoguider.fits'
             if os.path.exists(fname):
@@ -482,6 +534,8 @@ class AutoGuider(ChimeraObject,IAutoguider):
                                                               'East'))
 
         try:
+            self._disconnectTelEvents()
+
             if offset['N'].AS > 0.:
                 telescope.moveNorth(offset['N'].AS)
             elif offset['N'].AS < 0.:
@@ -499,6 +553,8 @@ class AutoGuider(ChimeraObject,IAutoguider):
 
         except Exception, e:
             self.log.error("ERROR. (%s)" % e)
+        finally:
+            self._connectTelEvents()
 
         # return
 
@@ -510,3 +566,60 @@ class AutoGuider(ChimeraObject,IAutoguider):
 
     def state(self):
         return self._state
+
+    def _connectTelEvents(self):
+
+        tel = self.getTel()
+        if not tel:
+            self.log.warning("Couldn't find telescope. Won't be able to guide without a telescope.")
+
+            return False
+
+        tel.slewBegin += self.getProxy()._telSlewBeginClbk
+        return True
+
+    def _disconnectTelEvents(self):
+
+        tel = self.getTel()
+        if tel:
+            tel.slewBegin -= self.getProxy()._telSlewBeginClbk
+            return True
+        return False
+
+    def _reconnectTelEvents(self):
+        self._disconnectTelEvents()
+        self._connectTelEvents()
+
+    # telescope callbacks
+    def _telSlewBeginClbk(self, target):
+
+        if self.state() == GuiderStatus.GUIDING:
+            self.stop() # Do this first, then log...
+            self.log.debug("[event] telescope slewing to %s. Stopping autoguider." % target)
+
+    def _connectSchedEvents(self):
+
+        sched = self.getScheduler()
+        if not sched:
+            self.log.info("Couldn't find scheduler.")
+            return False
+
+        sched.actionComplete += self.getProxy()._schedActionComplete
+        return True
+
+    def _disconnectSchedEvents(self):
+
+        sched = self.getScheduler()
+        if sched:
+            sched.actionComplete -= self.getProxy()._schedActionComplete
+            return True
+
+        return False
+
+    def _schedActionComplete(self, action, status, message=None):
+
+        self.log.debug("Got scheduler status: %s"%(str(status)))
+
+        if status == SchedulerStatus.ABORTED:
+            self.log.debug("Scheduler ABORTED (msg: %s) stopping autoguider."%(str(message)))
+            self.stop()
