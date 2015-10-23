@@ -78,7 +78,6 @@ class AutoGuider(ChimeraObject,IAutoguider):
                   "min_threshold"   : 0.5  ,    # After a guiding sequence starts the flux of the source may change
                                                 # due to sky transparency issues or else. What is the minimum value
                                                 # (in % of flux @ start) that should still be used for guiding?
-                  "scheduler"       : None ,
                   }
 
     def __init__(self):
@@ -263,6 +262,7 @@ class AutoGuider(ChimeraObject,IAutoguider):
             else:
                 self.ref_frame = self.lastFrame
 
+            self.guiderFlux = self.getFlux(self.ref_frame)
             self.abort.clear()
             self.guideStart(star_found)
 
@@ -275,11 +275,15 @@ class AutoGuider(ChimeraObject,IAutoguider):
                 while True:
                     frame = self._takeImage()
                     offset = self.getOffset(star_found,frame)
-                    self.log.debug('Offset %f x %f'%(offset['N'],offset['E']))
+                    self.log.debug('Offset %f x %f (flux = %.3e)'%(offset['N'],offset['E'],offset["FLUX"]))
+                    if offset["FLUX"] < self.guiderFlux*float(self["min_threshold"]):
+                        offset == False
+
                     if offset:
                         self.log.debug('Applying offset %s x %s'%(offset['N'],offset['E']))
                         self.applyOffset(offset)
                         self.offsetComplete(offset,frame)
+                        nlost = 0
                     else:
                         nlost+=1
 
@@ -313,9 +317,6 @@ class AutoGuider(ChimeraObject,IAutoguider):
 
     def _takeImageAndResolveStars(self):
 
-        # Todo: If there are saturated sources, try to modify exposure time so that star is suitable for guiding
-        # Todo: If guide star is bellow a certain threshold increase the exposure time
-
         frame = self._takeImage()
         stars = self._findStars(frame)
 
@@ -323,10 +324,12 @@ class AutoGuider(ChimeraObject,IAutoguider):
             self.log.debug("Running in auto-adjust mode...")
             # check if there is any saturated source that could use some exposure time undersize
             saturated_stars = [star for star in stars if star["FLAGS"] == 4]
+            # Todo: If there are saturated sources, try to modify exposure time so that star is suitable for guiding
             if len(saturated_stars) > 0:
-                # Found saturated stars try taking a new image with the minimum exposure time allowed
-                self.imageRequest["exptime"] *= float(self["min_exp_mod"])
+                # Found saturated stars. Try taking a new image with the minimum exposure time allowed
+                self.log.warning("Found %i saturated stars."%(len(saturated_stars)))
 
+            # Todo: If guide star is bellow a certain threshold increase the exposure time
 
         return stars
 
@@ -431,18 +434,28 @@ class AutoGuider(ChimeraObject,IAutoguider):
 
         return max(fluxes, key=lambda star: star["FLUX_BEST"])
 
+    def getFlux(self,frame):
+
+        fname = '/tmp/autoguider.fits'
+        if os.path.exists(fname):
+            os.remove(fname)
+        frame.save(fname)
+        img = fits.getdata(fname)[self.gdrWin[2]:self.gdrWin[3],
+                                  self.gdrWin[0]:self.gdrWin[1]]
+        # Extract some backgroud
+        img -= (np.mean(img)*0.9)
+        img[img < 0] = 0.
+        return np.sum(img)
 
     def getOffset(self,position,frame):
 
         ret = {'X':0.,'Y':0.,
                'N':Coord.fromAS(0.),'E':Coord.fromAS(0.),'Status':self.state(),
                'CurrentPos':Position.fromRaDec("00:00:00","00:00:00"),
-               'ReferencePos':Position.fromRaDec("00:00:00","00:00:00")}
+               'ReferencePos':Position.fromRaDec("00:00:00","00:00:00"),
+               'FLUX':0.}
 
         try:
-            # Todo: Check that the star is actually there
-            # Todo: Avoid offsets when star is bellow a certain flux threshold
-
             # frame = self._takeImage()
             fname = '/tmp/autoguider.fits'
             if os.path.exists(fname):
@@ -453,6 +466,7 @@ class AutoGuider(ChimeraObject,IAutoguider):
             # Extract some backgroud
             img -= (np.mean(img)*0.9)
             img[img < 0] = 0.
+            ret['FLUX'] = np.sum(img)
 
             pY,pX = centroid(img)
             ret['X'] = pX+self.gdrWin[0]-position["XWIN_IMAGE"]
