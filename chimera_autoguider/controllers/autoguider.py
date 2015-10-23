@@ -589,14 +589,17 @@ class AutoGuider(ChimeraObject,IAutoguider):
 
             return False
 
-        tel.slewBegin += self.getProxy()._telSlewBeginClbk
+        tel.slewBegin += self.getProxy()._stopGuidingClbk
+        tel.trackingStopped += self.getProxy()._stopGuidingClbk
+
         return True
 
     def _disconnectTelEvents(self):
 
         tel = self.getTel()
         if tel:
-            tel.slewBegin -= self.getProxy()._telSlewBeginClbk
+            tel.slewBegin -= self.getProxy()._stopGuidingClbk
+            tel.trackingStopped -= self.getProxy()._stopGuidingClbk
             return True
         return False
 
@@ -605,11 +608,11 @@ class AutoGuider(ChimeraObject,IAutoguider):
         self._connectTelEvents()
 
     # telescope callbacks
-    def _telSlewBeginClbk(self, target):
+    def _stopGuidingClbk(self, target):
 
         if self.state() == GuiderStatus.GUIDING:
             self.stop() # Do this first, then log...
-            self.log.debug("[event] telescope slewing to %s. Stopping autoguider." % target)
+            self.log.debug("[telescope-event] Stopping autoguider (%s)." % target)
 
     def _connectSchedEvents(self):
 
